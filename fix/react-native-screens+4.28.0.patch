@@ -1,0 +1,83 @@
+diff --git a/node_modules/react-native-screens/ios/RNSScreenStack.mm b/node_modules/react-native-screens/ios/RNSScreenStack.mm
+index c233036..98f5c38 100644
+--- a/node_modules/react-native-screens/ios/RNSScreenStack.mm
++++ b/node_modules/react-native-screens/ios/RNSScreenStack.mm
+@@ -175,6 +175,9 @@ @implementation RNSScreenStackView {
+   RNSPercentDrivenInteractiveTransition *_interactionController;
+   __weak RNSScreenStackManager *_manager;
+   BOOL _updateScheduled;
++  // Controller passed to `pushViewController:animated:` that UIKit has not added to `viewControllers` yet.
++  __weak UIViewController *_pendingPushController;
++  BOOL _pendingPushUpdateScheduled;
+ }
+ 
+ - (instancetype)initWithFrame:(CGRect)frame
+@@ -588,6 +591,20 @@ - (void)setPushViewControllers:(NSArray<UIViewController *> *)controllers
+   if (self.window == nil) {
+     return;
+   }
++  // On older iOS versions (observed on iOS 17) UIKit can defer an animated push until the current
++  // Core Animation transaction commits. Until then the pushed controller is not in `viewControllers`
++  // and `transitionCoordinator` is nil, so the checks above and below do not see the push. Another
++  // update in that window would push the same controller again, and UIKit throws
++  // `NSInvalidArgumentException` ("pushing the same view controller instance more than once")
++  // when it runs the deferred pushes. Wait until UIKit applies the pending push instead.
++  if (_pendingPushController != nil) {
++    if ([_controller.viewControllers containsObject:_pendingPushController]) {
++      _pendingPushController = nil;
++    } else {
++      [self schedulePendingPushUpdate];
++      return;
++    }
++  }
+   // when transition is ongoing, any updates made to the controller will not be reflected until the
+   // transition is complete. In particular, when we push/pop view controllers we expect viewControllers
+   // property to be updated immediately. Based on that property we then calculate future updates.
+@@ -663,6 +680,9 @@ - (void)setPushViewControllers:(NSArray<UIViewController *> *)controllers
+ 
+       [_controller setViewControllers:newControllers animated:NO];
+       [_controller pushViewController:top animated:YES];
++      if (![_controller.viewControllers containsObject:top]) {
++        _pendingPushController = top;
++      }
+     } else {
+       // don't really know what this case could be, but may need to handle it
+       // somehow
+@@ -674,6 +694,25 @@ - (void)setPushViewControllers:(NSArray<UIViewController *> *)controllers
+   }
+ }
+ 
++- (void)schedulePendingPushUpdate
++{
++  if (_pendingPushUpdateScheduled) {
++    return;
++  }
++  _pendingPushUpdateScheduled = YES;
++  __weak RNSScreenStackView *weakSelf = self;
++  // UIKit applies the deferred push after the current Core Animation transaction commits,
++  // so retry on the next main queue turn.
++  dispatch_async(dispatch_get_main_queue(), ^{
++    RNSScreenStackView *strongSelf = weakSelf;
++    if (strongSelf == nil) {
++      return;
++    }
++    strongSelf->_pendingPushUpdateScheduled = NO;
++    [strongSelf updateContainer];
++  });
++}
++
+ - (void)updateContainer
+ {
+   NSMutableArray<UIViewController *> *pushControllers = [NSMutableArray new];
+@@ -988,6 +1027,11 @@ - (void)navigationController:(UINavigationController *)navigationController
+        didShowViewController:(UIViewController *)viewController
+                     animated:(BOOL)animated
+ {
++  // Only the pending controller itself ends the pending push. A non-animated `setViewControllers:` right
++  // before the push also reports `didShow` for its top controller, before UIKit runs the held push.
++  if (viewController == _pendingPushController) {
++    _pendingPushController = nil;
++  }
+   [self emitOnFinishTransitioningEvent];
+   [RNSScreenWindowTraits updateWindowTraits];
+   // Because of the bug that caused view to have incorrect dimensions while changing the orientation,
